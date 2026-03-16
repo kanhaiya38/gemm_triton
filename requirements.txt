@@ -1,0 +1,4 @@
+torch>=2.3
+triton>=2.3
+torchvision>=0.18
+pytest>=8.0
