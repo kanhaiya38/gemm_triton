@@ -11,13 +11,17 @@ except ImportError:  # pragma: no cover
     tl = None
 
 
-def _check_inputs(x: torch.Tensor, weight_t: torch.Tensor, bias: torch.Tensor | None) -> tuple[int, int, int]:
+def _check_inputs(
+    x: torch.Tensor, weight_t: torch.Tensor, bias: torch.Tensor | None
+) -> tuple[int, int, int]:
     if triton is None:
         raise RuntimeError("Fused Triton kernel requires Triton to be installed.")
     if x.dim() != 2 or weight_t.dim() != 2:
         raise ValueError("Expected rank-2 tensors for x and weight_t")
     if x.shape[1] != weight_t.shape[0]:
-        raise ValueError(f"Incompatible shapes: {tuple(x.shape)} x {tuple(weight_t.shape)}")
+        raise ValueError(
+            f"Incompatible shapes: {tuple(x.shape)} x {tuple(weight_t.shape)}"
+        )
     if not x.is_cuda or not weight_t.is_cuda:
         raise ValueError("Expected CUDA tensors for fused Triton kernel")
     if not x.is_contiguous() or not weight_t.is_contiguous():
@@ -71,20 +75,45 @@ if triton is not None:
         - Bias is per-output feature (`N` dimension).
         - Apply ReLU after accumulation (and bias add if present).
         """
-        
+
+        pid_m = tl.program_id(0)
+        pid_n = tl.program_id(1)
+
+        row_offsets = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        col_offsets = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+
+        row_mask = row_offsets < M
+        col_mask = col_offsets < N
+
+        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+        for k in tl.range(0, K, BLOCK_K):
+            tmp = tl.arange(0, BLOCK_K) + k
+            a_offsets = row_offsets[:, None] * stride_am + tmp[None, :] * stride_ak
+            a = tl.load(a_ptr + a_offsets, mask=row_mask[:, None] & (tmp[None, :] < K))
+
+            b_offsets = col_offsets[None, :] * stride_bn + tmp[:, None] * stride_bk
+            b = tl.load(b_ptr + b_offsets, mask=col_mask[None, :] & (tmp[:, None] < K))
+
+            acc = tl.dot(a, b, acc)  # TODO: check with acc += tl.dot(a, b)
+
         if HAS_BIAS:
             """
             TODO: load bias for this block and add to accumulator after matmul
             """
-            pass
-        
+            bias_offsets = col_offsets[None, :] * stride_bias
+            bias = tl.load(bias_ptr + bias_offsets, mask=col_mask[None, :])
+            acc += bias
+
         if DO_RELU:
             """
             TODO: apply relu to accumulator
             """
-            pass    
-        
-        return
+            acc = tl.maximum(acc, 0.0)
+
+        c_offsets = row_offsets[:, None] * stride_cm + col_offsets[None, :] * stride_cn
+        c_mask = row_mask[:, None] & col_mask[None, :]
+        tl.store(c_ptr + c_offsets, acc, mask=c_mask)
 
 
 def fused_linear_relu(
@@ -111,17 +140,43 @@ def fused_linear_relu(
         - Set grid size
         - Use `_check_inputs(...)` to get M, N, K dimensions
         - Call kernel implelemented above with appropriate parameters
-    
+
     Compute y = relu(x @ weight_t + bias) if relu=True else x @ weight_t + bias.
     """
 
-    raise NotImplementedError(
-        "TODO: implement fused_linear_relu in src/gemm_lab/kernels/gemm_fused.py"
+    result = torch.empty((M, N), dtype=x.dtype, device="cuda")
+    grid = (triton.cdiv(M, block_m), triton.cdiv(N, block_n))
+
+    _fused_linear_bias_relu_kernel[grid](
+        x,
+        weight_t,
+        bias,
+        result,
+        M,
+        N,
+        K,
+        stride_am=x.stride(0),
+        stride_ak=x.stride(1),
+        stride_bk=weight_t.stride(0),
+        stride_bn=weight_t.stride(1),
+        stride_cm=result.stride(0),
+        stride_cn=result.stride(1),
+        stride_bias=bias.stride(0),
+        HAS_BIAS=bias is not None,
+        DO_RELU=relu,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        BLOCK_K=block_k,
+        num_warps=num_warps,
+        num_stages=num_stages,
     )
+
+    return result
 
 
 class FusedLinearReLU(nn.Module):
     """Linear layer with fused optional ReLU in one call path."""
+
     def __init__(
         self,
         in_features: int,
@@ -133,8 +188,12 @@ class FusedLinearReLU(nn.Module):
         debug: bool = False,
     ):
         super().__init__()
-        self.weight = nn.Parameter(torch.empty(out_features, in_features, device=device))
-        self.bias = nn.Parameter(torch.empty(out_features, device=device)) if bias else None
+        self.weight = nn.Parameter(
+            torch.empty(out_features, in_features, device=device)
+        )
+        self.bias = (
+            nn.Parameter(torch.empty(out_features, device=device)) if bias else None
+        )
         self.relu = relu
         self.debug = debug
         self.reset_parameters()

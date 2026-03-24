@@ -54,8 +54,30 @@ if triton is not None:
         - Tune num_warps and num_stages by shape bucket.
         - Ensure masked loads/stores are correct on boundary tiles.
         """
+        pid_m = tl.program_id(0)
+        pid_n = tl.program_id(1)
 
-        return
+        row_offsets = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        col_offsets = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+
+        row_mask = row_offsets < M
+        col_mask = col_offsets < N
+
+        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+        for k in tl.range(0, K, BLOCK_K):
+            tmp = tl.arange(0, BLOCK_K) + k
+            a_offsets = row_offsets[:, None] * stride_am + tmp[None, :] * stride_ak
+            a = tl.load(a_ptr + a_offsets, mask=row_mask[:, None] & (tmp[None, :] < K))
+
+            b_offsets = col_offsets[None, :] * stride_bn + tmp[:, None] * stride_bk
+            b = tl.load(b_ptr + b_offsets, mask=col_mask[None, :] & (tmp[:, None] < K))
+
+            acc = tl.dot(a, b, acc)
+
+        c_offsets = row_offsets[:, None] * stride_cm + col_offsets[None, :] * stride_cn
+        c_mask = row_mask[:, None] & col_mask[None, :]
+        tl.store(c_ptr + c_offsets, acc, mask=c_mask)
 
 
 def triton_gemm_tiled(
@@ -79,6 +101,26 @@ def triton_gemm_tiled(
         - Call kernel implelemented above with appropriate parameters
     """
 
-    raise NotImplementedError(
-        "TODO: implement triton_gemm_tiled in src/gemm_lab/kernels/gemm_tiled.py"
+    M, N, K = _check_inputs(a, b)
+    c = torch.empty((M, N), dtype=a.dtype, device="cuda")
+    grid = (triton.cdiv(M, block_m), triton.cdiv(N, block_n))
+    _gemm_kernel_tiled[grid](
+        a,
+        b,
+        c,
+        M,
+        N,
+        K,
+        stride_am=a.stride(0),
+        stride_ak=a.stride(1),
+        stride_bk=b.stride(0),
+        stride_bn=b.stride(1),
+        stride_cm=c.stride(0),
+        stride_cn=c.stride(1),
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        BLOCK_K=block_k,
+        num_warps=num_warps,
+        num_stages=num_stages,
     )
+    return c

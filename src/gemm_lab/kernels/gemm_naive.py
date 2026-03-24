@@ -53,7 +53,29 @@ if triton is not None:
         - Accumulate over K with scalar loads from A and B.
         - Store results into C with masked writes for boundary tiles.
         """
-        return
+        pid_m = tl.program_id(0)
+        pid_n = tl.program_id(1)
+
+        row_offsets = pid_m * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        col_offsets = pid_n * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+
+        row_mask = row_offsets < M
+        col_mask = col_offsets < N
+
+        acc = tl.zeros((BLOCK_SIZE, BLOCK_SIZE), dtype=tl.float32)
+
+        for k in tl.range(0, K):
+            a_offsets = row_offsets * stride_am + k * stride_ak
+            a = tl.load(a_ptr + a_offsets, mask=row_mask)
+
+            b_offsets = col_offsets * stride_bn + k * stride_bk
+            b = tl.load(b_ptr + b_offsets, mask=col_mask)
+
+            acc += a[:, None] * b[None, :]
+
+        c_offsets = row_offsets[:, None] * stride_cm + col_offsets[None, :] * stride_cn
+        c_mask = row_mask[:, None] & col_mask[None, :]
+        tl.store(c_ptr + c_offsets, acc, mask=c_mask)
 
 
 def triton_gemm_naive(
@@ -74,7 +96,25 @@ def triton_gemm_naive(
         - Define a grid over output tiles
         - Launch `_gemm_kernel_naive`
     """
-
-    raise NotImplementedError(
-        "TODO: implement triton_gemm_naive in src/gemm_lab/kernels/gemm_naive.py"
+    M, N, K = _check_inputs(a, b)
+    c = torch.empty((M, N), dtype=a.dtype, device="cuda")
+    assert c.is_cuda
+    grid = (triton.cdiv(M, block_size), triton.cdiv(N, block_size))
+    _gemm_kernel_naive[grid](
+        a,
+        b,
+        c,
+        M,
+        N,
+        K,
+        stride_am=a.stride(0),
+        stride_ak=a.stride(1),
+        stride_bk=b.stride(0),
+        stride_bn=b.stride(1),
+        stride_cm=c.stride(0),
+        stride_cn=c.stride(1),
+        BLOCK_SIZE=block_size,
+        num_warps=num_warps,
+        num_stages=num_stages,
     )
+    return c
