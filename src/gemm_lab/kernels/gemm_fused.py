@@ -95,7 +95,7 @@ if triton is not None:
             b_offsets = col_offsets[None, :] * stride_bn + tmp[:, None] * stride_bk
             b = tl.load(b_ptr + b_offsets, mask=col_mask[None, :] & (tmp[:, None] < K))
 
-            acc = tl.dot(a, b, acc)  # TODO: check with acc += tl.dot(a, b)
+            acc = tl.dot(a, b, acc)
 
         if HAS_BIAS:
             """
